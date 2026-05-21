@@ -19,7 +19,9 @@
 #include <openssl/sha.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -74,6 +76,9 @@ constexpr const char* SECRET_STORE_SERVICE = "OrcaSlicer/Auth";
 constexpr const char* SECRET_STORE_USER    = "orca_refresh_token";
 constexpr std::chrono::seconds TOKEN_REFRESH_SKEW{900}; // 15 minutes
 
+bool base64url_decode(const std::string& input, std::vector<unsigned char>& out);
+std::string sha256_base64url(const std::string& input);
+
 // Return a JSON field only when it is present as a string. Missing or non-string values normalize to empty.
 std::string get_json_string_field(const json& j, const std::string& key)
 {
@@ -81,6 +86,82 @@ std::string get_json_string_field(const json& j, const std::string& key)
         return j[key].get<std::string>();
     }
     return "";
+}
+
+uint64_t next_auth_request_id()
+{
+    static std::atomic_uint64_t request_id{0};
+    return ++request_id;
+}
+
+std::string token_fingerprint(const std::string& token)
+{
+    if (token.empty()) return "present=false";
+    const std::string fp = sha256_base64url(token);
+    return "present=true,len=" + std::to_string(token.size()) + ",fp=" + fp.substr(0, std::min<size_t>(12, fp.size()));
+}
+
+std::string jwt_claim_string(const json& payload, const std::string& key)
+{
+    if (!payload.contains(key) || payload[key].is_null()) return "";
+    if (payload[key].is_string()) return payload[key].get<std::string>();
+    if (payload[key].is_array()) {
+        std::string out;
+        for (const auto& item : payload[key]) {
+            if (!item.is_string()) continue;
+            if (!out.empty()) out += ",";
+            out += item.get<std::string>();
+        }
+        return out;
+    }
+    return payload[key].dump();
+}
+
+std::string token_summary(const std::string& token)
+{
+    std::string summary = token_fingerprint(token);
+    if (token.empty()) return summary;
+
+    auto first = token.find('.');
+    auto second = token.find('.', first == std::string::npos ? 0 : first + 1);
+    if (first == std::string::npos || second == std::string::npos) {
+        return summary + ",jwt=parseable=false";
+    }
+
+    std::vector<unsigned char> payload_bytes;
+    if (!base64url_decode(token.substr(first + 1, second - first - 1), payload_bytes)) {
+        return summary + ",jwt=parseable=false";
+    }
+
+    try {
+        const std::string payload_str(payload_bytes.begin(), payload_bytes.end());
+        const auto payload = json::parse(payload_str);
+        summary += ",jwt=parseable=true";
+        summary += ",iss=" + jwt_claim_string(payload, "iss");
+        summary += ",aud=" + jwt_claim_string(payload, "aud");
+        summary += ",sub=" + jwt_claim_string(payload, "sub");
+        if (payload.contains("iat") && payload["iat"].is_number()) {
+            summary += ",iat=" + std::to_string(payload["iat"].get<long long>());
+        }
+        if (payload.contains("exp") && payload["exp"].is_number()) {
+            const auto exp = payload["exp"].get<long long>();
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            summary += ",exp=" + std::to_string(exp);
+            summary += ",ttl_s=" + std::to_string(exp - now);
+        } else {
+            summary += ",exp=<missing>";
+        }
+    } catch (...) {
+        summary += ",jwt=parseable=false";
+    }
+    return summary;
+}
+
+long long seconds_until(std::chrono::system_clock::time_point tp)
+{
+    if (tp.time_since_epoch().count() == 0) return 0;
+    return std::chrono::duration_cast<std::chrono::seconds>(tp - std::chrono::system_clock::now()).count();
 }
 
 // Resolve the human-facing UI label from provider metadata.
@@ -516,6 +597,10 @@ int OrcaCloudServiceAgent::start()
 bool OrcaCloudServiceAgent::exchange_auth_code(const std::string& auth_code, const std::string& state, std::string& session_payload)
 {
     const auto expected_state = pkce_bundle.state;
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=code_exchange_start has_auth_code=" << (!auth_code.empty())
+                            << " has_state=" << (!state.empty())
+                            << " expected_state_present=" << (!expected_state.empty())
+                            << " state_match=" << (!expected_state.empty() && state == expected_state);
     if (expected_state.empty()) {
         BOOST_LOG_TRIVIAL(warning) << "[auth] event=code_exchange result=failure reason=no_expected_state";
         return false;
@@ -550,7 +635,7 @@ bool OrcaCloudServiceAgent::exchange_auth_code(const std::string& auth_code, con
     }
 
     session_payload = response;
-    BOOST_LOG_TRIVIAL(info) << "[auth] event=code_exchange result=success";
+    BOOST_LOG_TRIVIAL(info) << "[auth] event=code_exchange result=success response_len=" << response.size();
     return true;
 }
 
@@ -573,6 +658,14 @@ int OrcaCloudServiceAgent::change_user(std::string user_info)
             }
             const auto& data = tree["data"];
             std::string state = safe_str(data, "state");
+            const auto expected_state = pkce_bundle.state;
+            BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=webview_user_login payload_shape=command_data"
+                                    << " has_code=" << !safe_str(data, "code").empty()
+                                    << " has_access_token=" << (!safe_str(data, "access_token").empty() || !safe_str(data, "token").empty())
+                                    << " has_refresh_token=" << !safe_str(data, "refresh_token").empty()
+                                    << " has_state=" << !state.empty()
+                                    << " expected_state_present=" << !expected_state.empty()
+                                    << " state_match=" << (!expected_state.empty() && state == expected_state);
 
             // Check for auth code (PKCE authorization code flow)
             std::string auth_code = safe_str(data, "code");
@@ -586,7 +679,6 @@ int OrcaCloudServiceAgent::change_user(std::string user_info)
             }
 
             // Validate PKCE state
-            const auto expected_state = pkce_bundle.state;
             if (!expected_state.empty() && state != expected_state) {
                 BOOST_LOG_TRIVIAL(warning) << "[auth] event=login result=failure reason=state_mismatch";
                 return BAMBU_NETWORK_ERR_INVALID_HANDLE;
@@ -618,6 +710,10 @@ int OrcaCloudServiceAgent::change_user(std::string user_info)
         }
 
         if (session_node) {
+            BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=session_payload_detected"
+                                    << " has_access_token=" << (!get_json_string_field(*session_node, "access_token").empty() || !get_json_string_field(*session_node, "token").empty())
+                                    << " has_refresh_token=" << !get_json_string_field(*session_node, "refresh_token").empty()
+                                    << " has_user_object=" << (session_node->contains("user") && (*session_node)["user"].is_object());
             return set_user_session(*session_node)
                 ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_INVALID_HANDLE;
         }
@@ -1379,6 +1475,9 @@ void OrcaCloudServiceAgent::update_redirect_uri()
 
 void OrcaCloudServiceAgent::persist_refresh_token(const std::string& token)
 {
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=persist_refresh_token_start backend="
+                            << (m_use_encrypted_token_file ? "encrypted_file" : "secret_store")
+                            << " token=" << token_fingerprint(token);
     if (token.empty()) {
         clear_refresh_token();
         return;
@@ -1391,12 +1490,14 @@ void OrcaCloudServiceAgent::persist_refresh_token(const std::string& token)
         auto key = sha256_bytes(get_encryption_key());
         if (key.empty()) {
             BOOST_LOG_TRIVIAL(warning) << "OrcaCloudServiceAgent: cannot derive key for refresh-token file storage";
+            BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=persist_refresh_token_result backend=encrypted_file result=failure reason=key_derivation_failed";
             return;
         }
 
         std::string payload;
         if (!aes256gcm_encrypt(token, key, payload)) {
             BOOST_LOG_TRIVIAL(warning) << "OrcaCloudServiceAgent: failed to encrypt refresh token for file storage";
+            BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=persist_refresh_token_result backend=encrypted_file result=failure reason=encrypt_failed";
             return;
         }
 
@@ -1421,12 +1522,15 @@ void OrcaCloudServiceAgent::persist_refresh_token(const std::string& token)
 
             if (wxRenameFile(wxString::FromUTF8(tmp_path.c_str()), wxString::FromUTF8(refresh_fallback_path.c_str()), true)) {
                 stored = true;
+                BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=persist_refresh_token_result backend=encrypted_file result=success";
             } else {
                 wxRemoveFile(wxString::FromUTF8(tmp_path.c_str()));
                 BOOST_LOG_TRIVIAL(warning) << "OrcaCloudServiceAgent: failed to atomically replace refresh-token file";
+                BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=persist_refresh_token_result backend=encrypted_file result=failure reason=rename_failed";
             }
         } else {
             BOOST_LOG_TRIVIAL(warning) << "OrcaCloudServiceAgent: cannot open refresh-token file for write - " << refresh_fallback_path;
+            BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=persist_refresh_token_result backend=encrypted_file result=failure reason=open_failed";
         }
     } else {
         // Use wxSecretStore only
@@ -1435,11 +1539,14 @@ void OrcaCloudServiceAgent::persist_refresh_token(const std::string& token)
             wxSecretValue secret(wxString::FromUTF8(token.c_str()));
             if (store.Save(SECRET_STORE_SERVICE, SECRET_STORE_USER, secret)) {
                 stored = true;
+                BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=persist_refresh_token_result backend=secret_store result=success";
             } else {
                 BOOST_LOG_TRIVIAL(warning) << "OrcaCloudServiceAgent: System Keychain save failed";
+                BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=persist_refresh_token_result backend=secret_store result=failure reason=save_failed";
             }
         } else {
             BOOST_LOG_TRIVIAL(warning) << "OrcaCloudServiceAgent: System Keychain not available";
+            BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=persist_refresh_token_result backend=secret_store result=failure reason=unavailable";
         }
     }
 
@@ -1449,6 +1556,8 @@ void OrcaCloudServiceAgent::persist_refresh_token(const std::string& token)
 bool OrcaCloudServiceAgent::load_refresh_token(std::string& out_token)
 {
     out_token.clear();
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=load_refresh_token_start backend="
+                            << (m_use_encrypted_token_file ? "encrypted_file" : "secret_store");
 
     if (m_use_encrypted_token_file) {
         // Load from encrypted file only
@@ -1484,6 +1593,8 @@ bool OrcaCloudServiceAgent::load_refresh_token(std::string& out_token)
 
                 if (integrity_ok && aes256gcm_decrypt(encoded_payload, key, plain) && !plain.empty()) {
                     out_token = plain;
+                    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=load_refresh_token_result backend=encrypted_file result=success token="
+                                            << token_fingerprint(out_token);
                     // Upgrade legacy payloads to signed format
                     if (payload.rfind("v2:", 0) != 0) {
                         persist_refresh_token(out_token);
@@ -1500,12 +1611,19 @@ bool OrcaCloudServiceAgent::load_refresh_token(std::string& out_token)
             if (store.Load(SECRET_STORE_SERVICE, username, secret) && secret.IsOk()) {
                 out_token.assign(static_cast<const char*>(secret.GetData()), secret.GetSize());
                 if (!out_token.empty()) {
+                    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=load_refresh_token_result backend=secret_store result=success token="
+                                            << token_fingerprint(out_token);
                     return true;
                 }
             }
+        } else {
+            BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=load_refresh_token_result backend=secret_store result=failure reason=unavailable";
         }
     }
 
+    BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=load_refresh_token_result backend="
+                               << (m_use_encrypted_token_file ? "encrypted_file" : "secret_store")
+                               << " result=failure token=present=false";
     return false;
 }
 
@@ -1565,11 +1683,15 @@ bool OrcaCloudServiceAgent::decode_jwt_expiry(const std::string& token, std::chr
 
 bool OrcaCloudServiceAgent::refresh_now(const std::string& refresh_token, const std::string& reason, bool async)
 {
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=refresh_now_start reason=" << reason
+                            << " async=" << async
+                            << " refresh_token=" << token_fingerprint(refresh_token);
     if (refresh_token.empty()) return false;
 
     bool expected = false;
     if (!refresh_running.compare_exchange_strong(expected, true)) {
         BOOST_LOG_TRIVIAL(debug) << "OrcaCloudServiceAgent: refresh already running, skip (reason=" << reason << ")";
+        BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=refresh_now_result reason=" << reason << " result=failure reason_detail=already_running";
         return false;
     }
 
@@ -1577,6 +1699,7 @@ bool OrcaCloudServiceAgent::refresh_now(const std::string& refresh_token, const 
         (void) reason;
         bool ok = refresh_session_with_token(refresh_token);
         refresh_running.store(false);
+        BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=refresh_now_result reason=" << reason << " result=" << (ok ? "success" : "failure");
         return ok;
     };
 
@@ -1594,9 +1717,14 @@ bool OrcaCloudServiceAgent::refresh_now(const std::string& refresh_token, const 
 bool OrcaCloudServiceAgent::refresh_from_storage(const std::string& reason, bool async)
 {
     std::string refresh_token = get_refresh_token();
+    const bool had_memory_token = !refresh_token.empty();
     if (refresh_token.empty()) {
         load_refresh_token(refresh_token);
     }
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=refresh_from_storage reason=" << reason
+                            << " async=" << async
+                            << " memory_token_present=" << had_memory_token
+                            << " resolved_token=" << token_fingerprint(refresh_token);
     if (refresh_token.empty()) {
         BOOST_LOG_TRIVIAL(warning) << "OrcaCloudServiceAgent: no refresh token available for refresh (reason=" << reason << ")";
         return false;
@@ -1608,10 +1736,20 @@ bool OrcaCloudServiceAgent::refresh_from_storage(const std::string& reason, bool
 bool OrcaCloudServiceAgent::refresh_if_expiring(std::chrono::seconds skew, const std::string& reason)
 {
     bool needs_refresh = false;
+    bool logged_in = false;
+    long long expiry_delta = 0;
     {
         std::lock_guard<std::mutex> lock(session_mutex);
+        logged_in = session.logged_in;
+        expiry_delta = seconds_until(session.expires_at);
         needs_refresh = should_refresh_locked(skew);
     }
+
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=ensure_token_fresh reason=" << reason
+                            << " logged_in=" << logged_in
+                            << " expiry_delta_s=" << expiry_delta
+                            << " skew_s=" << skew.count()
+                            << " needs_refresh=" << needs_refresh;
 
     if (!needs_refresh) return true;
 
@@ -1627,12 +1765,18 @@ bool OrcaCloudServiceAgent::refresh_session_with_token(const std::string& refres
     std::string url = auth_base_url + auth_constants::TOKEN_PATH + "?grant_type=refresh_token";
     std::string  response;
     unsigned int http_code = 0;
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=refresh_session_request url=" << url
+                            << " refresh_token=" << token_fingerprint(refresh_token);
     if (!http_post_token(body, &response, &http_code, url) || http_code >= 400) {
-        std::string truncated_response = response.size() > 200 ? response.substr(0, 200) + "..." : response;
         BOOST_LOG_TRIVIAL(warning) << "OrcaCloudServiceAgent: token refresh failed - http_code=" << http_code
-                                   << ", response_body=" << truncated_response;
+                                   << ", response_body=" << response;
+        BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=refresh_session_result result=failure http_code=" << http_code
+                                   << " response_body=" << response;
         return false;
     }
+
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=refresh_session_result result=success http_code=" << http_code
+                            << " response_len=" << response.size();
 
     if (session_handler) {
         return session_handler(response);
@@ -1689,6 +1833,12 @@ bool OrcaCloudServiceAgent::set_user_session(const std::string& token,
     }
 
     BOOST_LOG_TRIVIAL(info) << "OrcaCloudServiceAgent: set_user_session - user_id=" << user_id << ", username=" << username;
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=set_user_session user_id=" << user_id
+                            << " username_present=" << !username.empty()
+                            << " access_token=" << token_summary(token)
+                            << " refresh_token=" << token_fingerprint(refresh_token)
+                            << " decoded_expiry=" << (exp_tp.time_since_epoch().count() != 0)
+                            << " expiry_delta_s=" << seconds_until(exp_tp);
     return true;
 }
 
@@ -1735,6 +1885,10 @@ bool OrcaCloudServiceAgent::set_user_session(const json& session_json, bool noti
 
     if (access_token.empty() || user_id.empty()) {
         BOOST_LOG_TRIVIAL(error) << "OrcaCloudServiceAgent: session payload missing access_token or user id";
+        BOOST_LOG_TRIVIAL(error) << "[auth_diag] event=set_user_session_json result=failure has_access_token=" << !access_token.empty()
+                                 << " has_user_id=" << !user_id.empty()
+                                 << " has_refresh_token=" << !refresh_token.empty()
+                                 << " nested_user=" << (session_json.contains("user") && session_json["user"].is_object());
         return false;
     }
 
@@ -1760,12 +1914,20 @@ void OrcaCloudServiceAgent::clear_session()
 
 bool OrcaCloudServiceAgent::attempt_refresh_after_unauthorized(const std::string& reason)
 {
-    if (refresh_from_storage(reason, false)) return true;
+    BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=unauthorized_refresh_start source=" << reason;
+    const bool first_ok = refresh_from_storage(reason, false);
+    BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=unauthorized_refresh_attempt source=" << reason
+                               << " attempt=1 result=" << (first_ok ? "success" : "failure");
+    if (first_ok) return true;
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    if (refresh_from_storage(reason + "_retry", false)) return true;
+    const bool retry_ok = refresh_from_storage(reason + "_retry", false);
+    BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=unauthorized_refresh_attempt source=" << reason
+                               << " attempt=2 result=" << (retry_ok ? "success" : "failure");
+    if (retry_ok) return true;
 
     BOOST_LOG_TRIVIAL(warning) << "[auth] event=refresh result=failure source=" << reason << " action=logout";
+    BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=unauthorized_refresh_result source=" << reason << " result=failure action=invoke_401_handler";
     return false;
 }
 
@@ -1782,7 +1944,10 @@ std::map<std::string, std::string> OrcaCloudServiceAgent::data_headers()
 int OrcaCloudServiceAgent::http_get(const std::string& path, std::string* response_body, unsigned int* http_code)
 {
     std::string url = api_base_url + path;
+    const uint64_t request_id = next_auth_request_id();
     BOOST_LOG_TRIVIAL(trace) << "OrcaCloudServiceAgent: GET " << url;
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=http_request_start request_id=" << request_id
+                            << " method=GET path=" << path << " url=" << url;
 
     if (!ensure_token_fresh("http_get_" + path))
         BOOST_LOG_TRIVIAL(warning) << "ensure_token_fresh returned false";
@@ -1793,13 +1958,19 @@ int OrcaCloudServiceAgent::http_get(const std::string& path, std::string* respon
         std::string body;
     };
 
-    auto perform = [&]() {
+    auto perform = [&](int attempt) {
         HttpResult result;
+        auto start_time = std::chrono::steady_clock::now();
         try {
             auto http = Http::get(url);
             http.tls_verify(true);
 
             std::string token = get_access_token();
+            BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=http_request_attempt request_id=" << request_id
+                                    << " attempt=" << attempt
+                                    << " method=GET path=" << path
+                                    << " authorization_attached=" << !token.empty()
+                                    << " access_token=" << token_summary(token);
 
             auto headers = data_headers();
             for (const auto& pair : headers) {
@@ -1820,21 +1991,35 @@ int OrcaCloudServiceAgent::http_get(const std::string& path, std::string* respon
                     result.status  = resp_status == 0 ? 404 : resp_status;
                     result.body    = body;
                     BOOST_LOG_TRIVIAL(error) << "OrcaCloudServiceAgent: HTTP error - " << error;
+                    BOOST_LOG_TRIVIAL(error) << "[auth_diag] event=http_transport_error request_id=" << request_id
+                                             << " attempt=" << attempt << " status=" << result.status
+                                             << " error=" << error;
                 })
                 .timeout_max(30)
                 .perform_sync();
 
         } catch (const std::exception& e) {
             BOOST_LOG_TRIVIAL(error) << "OrcaCloudServiceAgent: http_get exception - " << e.what();
+            BOOST_LOG_TRIVIAL(error) << "[auth_diag] event=http_exception request_id=" << request_id
+                                     << " attempt=" << attempt << " error=" << e.what();
         }
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+        BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=http_request_result request_id=" << request_id
+                                << " attempt=" << attempt << " method=GET path=" << path
+                                << " success=" << result.success << " status=" << result.status
+                                << " elapsed_ms=" << elapsed_ms
+                                << " body=" << result.body;
         return result;
     };
 
-    HttpResult res = perform();
+    HttpResult res = perform(1);
 
     // Single retry on 401 - no recursion
     if (res.status == 401 && attempt_refresh_after_unauthorized("http_get_" + path)) {
-        res = perform();
+        BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=http_retry_after_refresh request_id=" << request_id
+                                   << " method=GET path=" << path;
+        res = perform(2);
     }
 
     if (response_body) *response_body = res.body;
@@ -1850,7 +2035,11 @@ int OrcaCloudServiceAgent::http_get(const std::string& path, std::string* respon
 int OrcaCloudServiceAgent::http_post(const std::string& path, const std::string& body, std::string* response_body, unsigned int* http_code)
 {
     std::string url = api_base_url + path;
+    const uint64_t request_id = next_auth_request_id();
     BOOST_LOG_TRIVIAL(trace) << "OrcaCloudServiceAgent: POST " << url;
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=http_request_start request_id=" << request_id
+                            << " method=POST path=" << path << " url=" << url
+                            << " request_body_len=" << body.size();
 
     ensure_token_fresh("http_post_" + path);
 
@@ -1860,13 +2049,19 @@ int OrcaCloudServiceAgent::http_post(const std::string& path, const std::string&
         std::string body;
     };
 
-    auto perform = [&]() {
+    auto perform = [&](int attempt) {
         HttpResult result;
+        auto start_time = std::chrono::steady_clock::now();
         try {
             auto http = Http::post(url);
             http.tls_verify(true);
 
             std::string token = get_access_token();
+            BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=http_request_attempt request_id=" << request_id
+                                    << " attempt=" << attempt
+                                    << " method=POST path=" << path
+                                    << " authorization_attached=" << !token.empty()
+                                    << " access_token=" << token_summary(token);
 
             auto headers = data_headers();
             for (const auto& pair : headers) {
@@ -1890,21 +2085,35 @@ int OrcaCloudServiceAgent::http_post(const std::string& path, const std::string&
                     result.status  = resp_status == 0 ? 404 : resp_status;
                     result.body    = body;
                     BOOST_LOG_TRIVIAL(error) << "OrcaCloudServiceAgent: HTTP error - " << error;
+                    BOOST_LOG_TRIVIAL(error) << "[auth_diag] event=http_transport_error request_id=" << request_id
+                                             << " attempt=" << attempt << " status=" << result.status
+                                             << " error=" << error;
                 })
                 .timeout_max(30)
                 .perform_sync();
 
         } catch (const std::exception& e) {
             BOOST_LOG_TRIVIAL(error) << "OrcaCloudServiceAgent: http_post exception - " << e.what();
+            BOOST_LOG_TRIVIAL(error) << "[auth_diag] event=http_exception request_id=" << request_id
+                                     << " attempt=" << attempt << " error=" << e.what();
         }
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+        BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=http_request_result request_id=" << request_id
+                                << " attempt=" << attempt << " method=POST path=" << path
+                                << " success=" << result.success << " status=" << result.status
+                                << " elapsed_ms=" << elapsed_ms
+                                << " body=" << result.body;
         return result;
     };
 
-    HttpResult res = perform();
+    HttpResult res = perform(1);
 
     // Single retry on 401 - no recursion
     if (res.status == 401 && attempt_refresh_after_unauthorized("http_post_" + path)) {
-        res = perform();
+        BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=http_retry_after_refresh request_id=" << request_id
+                                   << " method=POST path=" << path;
+        res = perform(2);
     }
 
     if (response_body) *response_body = res.body;
@@ -1920,7 +2129,11 @@ int OrcaCloudServiceAgent::http_post(const std::string& path, const std::string&
 int OrcaCloudServiceAgent::http_put(const std::string& path, const std::string& body, std::string* response_body, unsigned int* http_code)
 {
     std::string url = api_base_url + path;
+    const uint64_t request_id = next_auth_request_id();
     BOOST_LOG_TRIVIAL(trace) << "OrcaCloudServiceAgent: PUT " << url;
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=http_request_start request_id=" << request_id
+                            << " method=PUT path=" << path << " url=" << url
+                            << " request_body_len=" << body.size();
 
     ensure_token_fresh("http_put_" + path);
 
@@ -1930,13 +2143,19 @@ int OrcaCloudServiceAgent::http_put(const std::string& path, const std::string& 
         std::string body;
     };
 
-    auto perform = [&]() {
+    auto perform = [&](int attempt) {
         HttpResult result;
+        auto start_time = std::chrono::steady_clock::now();
         try {
             auto http = Http::put(url);
             http.tls_verify(true);
 
             std::string token = get_access_token();
+            BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=http_request_attempt request_id=" << request_id
+                                    << " attempt=" << attempt
+                                    << " method=PUT path=" << path
+                                    << " authorization_attached=" << !token.empty()
+                                    << " access_token=" << token_summary(token);
 
             auto headers = data_headers();
             for (const auto& pair : headers) {
@@ -1960,21 +2179,35 @@ int OrcaCloudServiceAgent::http_put(const std::string& path, const std::string& 
                     result.status  = resp_status == 0 ? 404 : resp_status;
                     result.body    = body;
                     BOOST_LOG_TRIVIAL(error) << "OrcaCloudServiceAgent: HTTP error - " << error;
+                    BOOST_LOG_TRIVIAL(error) << "[auth_diag] event=http_transport_error request_id=" << request_id
+                                             << " attempt=" << attempt << " status=" << result.status
+                                             << " error=" << error;
                 })
                 .timeout_max(30)
                 .perform_sync();
 
         } catch (const std::exception& e) {
             BOOST_LOG_TRIVIAL(error) << "OrcaCloudServiceAgent: http_put exception - " << e.what();
+            BOOST_LOG_TRIVIAL(error) << "[auth_diag] event=http_exception request_id=" << request_id
+                                     << " attempt=" << attempt << " error=" << e.what();
         }
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+        BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=http_request_result request_id=" << request_id
+                                << " attempt=" << attempt << " method=PUT path=" << path
+                                << " success=" << result.success << " status=" << result.status
+                                << " elapsed_ms=" << elapsed_ms
+                                << " body=" << result.body;
         return result;
     };
 
-    HttpResult res = perform();
+    HttpResult res = perform(1);
 
     // Single retry on 401 - no recursion
     if (res.status == 401 && attempt_refresh_after_unauthorized("http_put_" + path)) {
-        res = perform();
+        BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=http_retry_after_refresh request_id=" << request_id
+                                   << " method=PUT path=" << path;
+        res = perform(2);
     }
 
     if (response_body) *response_body = res.body;
@@ -1990,7 +2223,10 @@ int OrcaCloudServiceAgent::http_put(const std::string& path, const std::string& 
 int OrcaCloudServiceAgent::http_delete(const std::string& path, std::string* response_body, unsigned int* http_code)
 {
     std::string url = api_base_url + path;
+    const uint64_t request_id = next_auth_request_id();
     BOOST_LOG_TRIVIAL(trace) << "OrcaCloudServiceAgent: DELETE " << url;
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=http_request_start request_id=" << request_id
+                            << " method=DELETE path=" << path << " url=" << url;
 
     ensure_token_fresh("http_delete_" + path);
 
@@ -2000,13 +2236,19 @@ int OrcaCloudServiceAgent::http_delete(const std::string& path, std::string* res
         std::string body;
     };
 
-    auto perform = [&]() {
+    auto perform = [&](int attempt) {
         HttpResult result;
+        auto start_time = std::chrono::steady_clock::now();
         try {
             auto http = Http::del(url);
             http.tls_verify(true);
 
             std::string token = get_access_token();
+            BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=http_request_attempt request_id=" << request_id
+                                    << " attempt=" << attempt
+                                    << " method=DELETE path=" << path
+                                    << " authorization_attached=" << !token.empty()
+                                    << " access_token=" << token_summary(token);
 
             auto headers = data_headers();
             for (const auto& pair : headers) {
@@ -2027,21 +2269,35 @@ int OrcaCloudServiceAgent::http_delete(const std::string& path, std::string* res
                     result.status  = resp_status == 0 ? 404 : resp_status;
                     result.body    = resp_body;
                     BOOST_LOG_TRIVIAL(error) << "OrcaCloudServiceAgent: HTTP error - " << error;
+                    BOOST_LOG_TRIVIAL(error) << "[auth_diag] event=http_transport_error request_id=" << request_id
+                                             << " attempt=" << attempt << " status=" << result.status
+                                             << " error=" << error;
                 })
                 .timeout_max(30)
                 .perform_sync();
 
         } catch (const std::exception& e) {
             BOOST_LOG_TRIVIAL(error) << "OrcaCloudServiceAgent: http_delete exception - " << e.what();
+            BOOST_LOG_TRIVIAL(error) << "[auth_diag] event=http_exception request_id=" << request_id
+                                     << " attempt=" << attempt << " error=" << e.what();
         }
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+        BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=http_request_result request_id=" << request_id
+                                << " attempt=" << attempt << " method=DELETE path=" << path
+                                << " success=" << result.success << " status=" << result.status
+                                << " elapsed_ms=" << elapsed_ms
+                                << " body=" << result.body;
         return result;
     };
 
-    HttpResult res = perform();
+    HttpResult res = perform(1);
 
     // Single retry on 401 - no recursion
     if (res.status == 401 && attempt_refresh_after_unauthorized("http_delete_" + path)) {
-        res = perform();
+        BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=http_retry_after_refresh request_id=" << request_id
+                                   << " method=DELETE path=" << path;
+        res = perform(2);
     }
 
     if (response_body) *response_body = res.body;
@@ -2058,6 +2314,7 @@ bool OrcaCloudServiceAgent::http_post_token(const std::string& body, std::string
 {
     std::map<std::string, std::string> headers_copy;
     std::string                        url;
+    const uint64_t request_id = next_auth_request_id();
     {
         std::lock_guard<std::mutex> lock(headers_mutex);
         url          = custom_url.empty() ? (auth_base_url + auth_constants::TOKEN_PATH) : custom_url;
@@ -2073,6 +2330,9 @@ bool OrcaCloudServiceAgent::http_post_token(const std::string& body, std::string
     }
 
     BOOST_LOG_TRIVIAL(trace) << "OrcaCloudServiceAgent: POST " << url;
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=token_http_request_start request_id=" << request_id
+                            << " url=" << url
+                            << " request_body_len=" << body.size();
 
     bool has_apikey = false;
     for (const auto& pair : headers_copy) {
@@ -2082,8 +2342,12 @@ bool OrcaCloudServiceAgent::http_post_token(const std::string& body, std::string
     if (!has_apikey) {
         BOOST_LOG_TRIVIAL(warning) << "OrcaCloudServiceAgent: http_post_token - apikey header MISSING! Token request will likely fail.";
     }
+    BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=token_http_headers request_id=" << request_id
+                            << " has_apikey=" << has_apikey
+                            << " authorization_removed=true";
 
     try {
+        auto start_time = std::chrono::steady_clock::now();
         auto http = Http::post(url);
         http.tls_verify(true);
 
@@ -2110,9 +2374,20 @@ bool OrcaCloudServiceAgent::http_post_token(const std::string& body, std::string
                 status    = resp_status == 0 ? 404 : resp_status;
                 resp_body = body;
                 BOOST_LOG_TRIVIAL(error) << "OrcaCloudServiceAgent: HTTP error - " << error;
+                BOOST_LOG_TRIVIAL(error) << "[auth_diag] event=token_http_transport_error request_id=" << request_id
+                                         << " status=" << status
+                                         << " error=" << error;
             })
             .timeout_max(30)
             .perform_sync();
+
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+        BOOST_LOG_TRIVIAL(info) << "[auth_diag] event=token_http_request_result request_id=" << request_id
+                                << " success=" << success
+                                << " status=" << status
+                                << " elapsed_ms=" << elapsed_ms
+                                << " body=" << resp_body;
 
         if (response_body)
             *response_body = resp_body;
@@ -2122,6 +2397,8 @@ bool OrcaCloudServiceAgent::http_post_token(const std::string& body, std::string
 
     } catch (const std::exception& e) {
         BOOST_LOG_TRIVIAL(error) << "OrcaCloudServiceAgent: http_post_token exception - " << e.what();
+        BOOST_LOG_TRIVIAL(error) << "[auth_diag] event=token_http_exception request_id=" << request_id
+                                 << " error=" << e.what();
         if (http_code)
             *http_code = 0;
         return false;

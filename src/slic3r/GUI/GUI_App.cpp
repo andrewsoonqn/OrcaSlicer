@@ -24,9 +24,11 @@
 #include "slic3r/GUI/I18N.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <iterator>
 #include <exception>
 #include <cstdlib>
+#include <functional>
 #include <regex>
 #include <thread>
 #include <string_view>
@@ -4845,7 +4847,13 @@ void GUI_App::on_http_error(wxCommandEvent &evt)
     // request login
     if (status == 401) {
         if (m_agent) {
-            if (m_agent->is_user_login(provider)) {
+            const bool user_logged_in = m_agent->is_user_login(provider);
+            BOOST_LOG_TRIVIAL(warning) << "[auth_diag] event=gui_http_401_handler provider=" << provider
+                                       << " status=" << status
+                                       << " user_logged_in=" << user_logged_in
+                                       << " action=" << (user_logged_in ? "request_user_logout" : "ignore_not_logged_in")
+                                       << " body=" << body_str;
+            if (user_logged_in) {
                 BOOST_LOG_TRIVIAL(warning) << "logout: http error 401.";
                 this->request_user_logout(provider);
 
