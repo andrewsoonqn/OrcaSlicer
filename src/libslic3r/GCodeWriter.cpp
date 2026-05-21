@@ -1,5 +1,6 @@
 #include "GCodeWriter.hpp"
 #include "CustomGCode.hpp"
+#include "I18N.hpp"
 #include "PrintConfig.hpp"
 #include <algorithm>
 #include <iomanip>
@@ -308,7 +309,7 @@ std::string GCodeWriter::set_accel_and_jerk(unsigned int acceleration, double je
 {
     // Only Klipper supports setting acceleration and jerk at the same time. Throw an error if we try to do this on other flavours.
     if(FLAVOR_IS_NOT(gcfKlipper))
-        throw std::runtime_error("set_accel_and_jerk() is only supported by Klipper");
+        throw std::runtime_error(_u8L("set_accel_and_jerk() is only supported by Klipper"));
 
     // Clamp the acceleration to the allowed maximum.
     if (m_max_acceleration > 0 && acceleration > m_max_acceleration)
@@ -461,10 +462,10 @@ std::string GCodeWriter::set_input_shaping(char axis, float damp, float freq, st
         break;
     }
     case gcfMarlinLegacy: {
-        throw std::runtime_error("Input shaping is not supported by Marlin < 2.1.2.\nCheck your firmware version and update your G-code flavor to ´Marlin 2´");
+        throw std::runtime_error(_u8L("Input shaping is not supported by Marlin < 2.1.2.\nCheck your firmware version and update your G-code flavor to ´Marlin 2´"));
     }
     default:
-        throw std::runtime_error("Input shaping is only supported by Klipper, RepRapFirmware and Marlin 2");
+        throw std::runtime_error(_u8L("Input shaping is only supported by Klipper, RepRapFirmware and Marlin 2"));
     }
     if (!gcode.str().empty()) {
         if (GCodeWriter::full_gcode_comment) {
@@ -1091,9 +1092,13 @@ std::string GCodeWriter::unlift()
     return gcode;
 }
 
-std::string GCodeWriter::set_fan(const GCodeFlavor gcode_flavor, unsigned int speed)
+std::string GCodeWriter::set_fan(const GCodeFlavor gcode_flavor, unsigned int speed, unsigned int part_cooling_fan_min_pwm)
 {
     std::ostringstream gcode;
+    // ORCA: clamp non-zero fan commands up to the configured PWM floor so fans that can't spool at low duty
+    // cycles still start reliably. Zero (fan off) is preserved exactly so disable-fan commands are never altered.
+    if (speed > 0 && part_cooling_fan_min_pwm > 0 && speed < part_cooling_fan_min_pwm)
+        speed = part_cooling_fan_min_pwm;
     if (speed == 0) {
         switch (gcode_flavor) {
         case gcfTeacup:
@@ -1128,7 +1133,9 @@ std::string GCodeWriter::set_fan(const GCodeFlavor gcode_flavor, unsigned int sp
 std::string GCodeWriter::set_fan(unsigned int speed) const
 {
     //BBS
-    return GCodeWriter::set_fan(this->config.gcode_flavor, speed);
+    // ORCA: pick up the per-printer PWM floor from the active config.
+    return GCodeWriter::set_fan(this->config.gcode_flavor, speed,
+                                static_cast<unsigned int>(std::max(0, this->config.part_cooling_fan_min_pwm.value)));
 }
 
 //BBS: set additional fan speed for BBS machine only
