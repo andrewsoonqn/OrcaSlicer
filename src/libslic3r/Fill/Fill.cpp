@@ -256,23 +256,25 @@ struct SurfaceFillParams
 
 	// Index of this entry in a linear vector.
     size_t 			idx = 0;
-	// infill speed settings
-	float			sparse_infill_speed = 0;
-	float			top_surface_speed = 0;
-	float			solid_infill_speed = 0;
+	// Infill speed setting for the effective extrusion role.
+	float role_speed = 0;
 
     // Params for lattice infill angles
     float lateral_lattice_angle_1 = 0.f;
     float lateral_lattice_angle_2 = 0.f;
-    float infill_lock_depth          = 0;
-    float skin_infill_depth          = 0;
-    bool symmetric_infill_y_axis = false;
+    float infill_lock_depth       = 0;
+    float skin_infill_depth       = 0;
+    bool symmetric_infill_y_axis  = false;
 
     // Params for Lateral honeycomb
     float infill_overhang_angle = 60.f;
 
     // For Gyroid: when true, use the parameterized "optimized" wave.
     bool gyroid_optimized = false;
+
+    bool                   anisotropic_surfaces{false};
+    CenterOfSurfacePattern center_of_surface_pattern{CenterOfSurfacePattern::Each_Surface};
+    bool                   separated_infills{false};
 
 	bool operator<(const SurfaceFillParams &rhs) const {
 #define RETURN_COMPARE_NON_EQUAL(KEY) if (this->KEY < rhs.KEY) return true; if (this->KEY > rhs.KEY) return false;
@@ -298,44 +300,47 @@ struct SurfaceFillParams
 		RETURN_COMPARE_NON_EQUAL(flow.nozzle_diameter());
 		RETURN_COMPARE_NON_EQUAL_TYPED(unsigned, bridge);
 		RETURN_COMPARE_NON_EQUAL_TYPED(unsigned, extrusion_role);
-		RETURN_COMPARE_NON_EQUAL(sparse_infill_speed);
-		RETURN_COMPARE_NON_EQUAL(top_surface_speed);
-		RETURN_COMPARE_NON_EQUAL(solid_infill_speed);
+		RETURN_COMPARE_NON_EQUAL(role_speed);
         RETURN_COMPARE_NON_EQUAL(lateral_lattice_angle_1);
 		RETURN_COMPARE_NON_EQUAL(lateral_lattice_angle_2);
 		RETURN_COMPARE_NON_EQUAL(symmetric_infill_y_axis);
 		RETURN_COMPARE_NON_EQUAL(infill_lock_depth);
-		RETURN_COMPARE_NON_EQUAL(skin_infill_depth);		RETURN_COMPARE_NON_EQUAL(infill_overhang_angle);
+		RETURN_COMPARE_NON_EQUAL(skin_infill_depth);
+        RETURN_COMPARE_NON_EQUAL(infill_overhang_angle);
 		RETURN_COMPARE_NON_EQUAL(gyroid_optimized);
+        RETURN_COMPARE_NON_EQUAL(anisotropic_surfaces);
+        RETURN_COMPARE_NON_EQUAL(center_of_surface_pattern);
+        RETURN_COMPARE_NON_EQUAL(separated_infills);
 
 		return false;
 	}
 
 	bool operator==(const SurfaceFillParams &rhs) const {
-		return  this->extruder 			== rhs.extruder 		&&
-				this->pattern 			== rhs.pattern 			&&
-				this->spacing 			== rhs.spacing 			&&
-				this->overlap 			== rhs.overlap 			&&
-				this->angle   			== rhs.angle   			&&
-				this->fixed_angle == rhs.fixed_angle &&
-				this->bridge   			== rhs.bridge   		&&
-				this->bridge_angle 		== rhs.bridge_angle		&&
-				this->density   		== rhs.density   		&&
-				this->multiline             == rhs.multiline    &&
-//				this->dont_adjust   	== rhs.dont_adjust 		&&
-				this->anchor_length  	== rhs.anchor_length    &&
-				this->anchor_length_max == rhs.anchor_length_max &&
-				this->flow 				== rhs.flow 			&&
-				this->extrusion_role	== rhs.extrusion_role	&&
-				this->sparse_infill_speed	== rhs.sparse_infill_speed &&
-				this->top_surface_speed		== rhs.top_surface_speed &&
-				this->solid_infill_speed	== rhs.solid_infill_speed &&
-                this->lateral_lattice_angle_1		== rhs.lateral_lattice_angle_1 &&
-				this->lateral_lattice_angle_2	    == rhs.lateral_lattice_angle_2 &&
-				this->infill_lock_depth      ==  rhs.infill_lock_depth &&
-				this->skin_infill_depth      ==  rhs.skin_infill_depth &&
-                this->infill_overhang_angle == rhs.infill_overhang_angle &&
-                this->gyroid_optimized      == rhs.gyroid_optimized;
+		return  this->extruder 			      == rhs.extruder                &&
+				this->pattern 			      == rhs.pattern                 &&
+				this->spacing 			      == rhs.spacing                 &&
+				this->overlap 			      == rhs.overlap                 &&
+				this->angle   			      == rhs.angle                   &&
+				this->fixed_angle             == rhs.fixed_angle             &&
+				this->bridge                  == rhs.bridge                  &&
+				this->bridge_angle            == rhs.bridge_angle            &&
+				this->density                 == rhs.density                 &&
+				this->multiline               == rhs.multiline               &&
+//				this->dont_adjust             == rhs.dont_adjust             &&
+				this->anchor_length           == rhs.anchor_length           &&
+				this->anchor_length_max       == rhs.anchor_length_max       &&
+				this->flow                    == rhs.flow                    &&
+				this->extrusion_role          == rhs.extrusion_role          &&
+				this->role_speed              == rhs.role_speed              &&
+                this->lateral_lattice_angle_1 == rhs.lateral_lattice_angle_1 &&
+				this->lateral_lattice_angle_2 == rhs.lateral_lattice_angle_2 &&
+				this->infill_lock_depth       == rhs.infill_lock_depth       &&
+				this->skin_infill_depth       == rhs.skin_infill_depth       &&
+                this->infill_overhang_angle   == rhs.infill_overhang_angle   &&
+                this->anisotropic_surfaces    == rhs.anisotropic_surfaces &&
+                this->center_of_surface_pattern == rhs.center_of_surface_pattern &&
+                this->separated_infills       == rhs.separated_infills &&
+                this->gyroid_optimized        == rhs.gyroid_optimized;
 	}
 };
 
@@ -874,6 +879,9 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                 params.lateral_lattice_angle_1 = region_config.lateral_lattice_angle_1;
                 params.lateral_lattice_angle_2 = region_config.lateral_lattice_angle_2;
                 params.infill_overhang_angle = region_config.infill_overhang_angle;
+                params.anisotropic_surfaces = region_config.anisotropic_surfaces;
+                params.center_of_surface_pattern = region_config.center_of_surface_pattern;
+                params.separated_infills = region_config.separated_infills;
                 if (params.pattern == ipLockedZag) {
                     params.infill_lock_depth = scale_(region_config.infill_lock_depth);
                     params.skin_infill_depth = scale_(region_config.skin_infill_depth);
@@ -922,6 +930,12 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                         params.extrusion_role = erSolidInfill;
                     }
                 }
+                if (params.extrusion_role == erTopSolidInfill)
+                    params.extruder = region_config.top_surface_filament_id;
+                else if (params.extrusion_role == erBottomSurface)
+                    params.extruder = region_config.bottom_surface_filament_id;
+                else if (params.extrusion_role == erSolidInfill)
+                    params.extruder = region_config.internal_solid_filament_id;
                 // Orca: apply fill multiline only for sparse infill
                 params.multiline = params.extrusion_role == erInternalInfill ? int(region_config.fill_multiline) : 1;
 
@@ -936,15 +950,25 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                                                                    region_config.sparse_infill_rotate_template.value);
                     params.fixed_angle = !region_config.sparse_infill_rotate_template.value.empty();
                 } else {
-                    params.angle = calculate_infill_rotation_angle(layer.object(), layer.id(), region_config.solid_infill_direction.value,
-                                                                   region_config.solid_infill_rotate_template.value);
-                    params.fixed_angle = !region_config.solid_infill_rotate_template.value.empty();
+                    const bool top_layer_direction_set    = surface.is_top() && region_config.top_layer_direction.value >= 0.;
+                    const bool bottom_layer_direction_set = surface.is_bottom() && region_config.bottom_layer_direction.value >= 0.;
+                    if (top_layer_direction_set || bottom_layer_direction_set) {
+                        params.angle = Geometry::deg2rad(top_layer_direction_set ? region_config.top_layer_direction.value : region_config.bottom_layer_direction.value);
+                        params.fixed_angle = true;
+                    } else {
+                        params.angle = calculate_infill_rotation_angle(layer.object(), layer.id(), region_config.solid_infill_direction.value,
+                                                                       region_config.solid_infill_rotate_template.value);
+                        params.fixed_angle = !region_config.solid_infill_rotate_template.value.empty();
+                    }
                 }
                 params.bridge_angle = float(surface.bridge_angle);
-                
+
+                // ORCA: Align infill angle to model
+                float align_offset = 0.f;
                 if (region_config.align_infill_direction_to_model) {
                     auto m = layer.object()->trafo().matrix();
-                    params.angle += atan2((float) m(1, 0), (float) m(0, 0));
+                    align_offset = atan2((float)m(1, 0), (float)m(0, 0));
+                    params.angle += align_offset;
                 }
 
                 // Calculate the actual flow we'll be using for this infill.
@@ -954,15 +978,18 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 					//Orca: enable thick bridge based on config
 					layerm.bridging_flow(extrusion_role, is_thick_bridge) :
 					layerm.flow(extrusion_role, (surface.thickness == -1) ? layer.height : surface.thickness);
-				// record speed params
-                if (!params.bridge) {
-                    if (params.extrusion_role == erInternalInfill)
-                        params.sparse_infill_speed = region_config.sparse_infill_speed;
-                    else if (params.extrusion_role == erTopSolidInfill) {
-                        params.top_surface_speed = region_config.top_surface_speed;
-                    } else if (params.extrusion_role == erSolidInfill)
-                        params.solid_infill_speed = region_config.internal_solid_infill_speed;
-                }
+
+				params.role_speed = 0;
+                if (params.extrusion_role == erBridgeInfill)
+                    params.role_speed = region_config.bridge_speed.get_at(layer.get_extruder_id(params.extruder));
+                else if (params.extrusion_role == erInternalBridgeInfill)
+                    params.role_speed = region_config.get_abs_value_at("internal_bridge_speed", layer.get_extruder_id(params.extruder));
+                else if (params.extrusion_role == erInternalInfill)
+                    params.role_speed = region_config.sparse_infill_speed.get_at(layer.get_extruder_id(params.extruder));
+                else if (params.extrusion_role == erTopSolidInfill)
+                    params.role_speed = region_config.top_surface_speed.get_at(layer.get_extruder_id(params.extruder));
+                else if (params.extrusion_role == erSolidInfill)
+                    params.role_speed = region_config.internal_solid_infill_speed.get_at(layer.get_extruder_id(params.extruder));
 				// Calculate flow spacing for infill pattern generation.
 		        if (surface.is_solid() || is_bridge) {
 		            params.spacing = params.flow.spacing();
@@ -1027,6 +1054,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                     if (fill.region_id == size_t(-1)) {
 	        			fill.region_id = region_id;
 	        			fill.surface = surface;
+            		    fill.surface.bridge_angle = params->bridge_angle;
 	        			fill.expolygons.emplace_back(std::move(fill.surface.expolygon));
 						//BBS
 						fill.region_id_group.push_back(region_id);
@@ -1295,6 +1323,22 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         params.config               = &region_config;
         params.pattern              = surface_fill.params.pattern;
 
+        // Orca: Checking the filling of a centered surface by drawing for each model parts
+        bool is_top_or_bottom = params.extrusion_role == erTopSolidInfill || params.extrusion_role == erBottomSurface;
+        bool is_centered_infill = surface_fill.params.pattern == ipArchimedeanChords || surface_fill.params.pattern == ipOctagramSpiral;
+        if (is_top_or_bottom) {
+            params.is_anisotropic            = surface_fill.params.anisotropic_surfaces;      // Orca: anisotropic surfaces
+            params.center_of_surface_pattern = surface_fill.params.center_of_surface_pattern; // Orca: center of surface pattern
+        }
+        // Orca: Each_Model centers the pattern on each model part's bbox; Each_Surface / Each_Assembly
+        // fall through to the default (whole-object) bounding box below.
+        bool is_per_model_center = is_top_or_bottom && params.center_of_surface_pattern == CenterOfSurfacePattern::Each_Model && is_centered_infill;
+        bool is_separate_infill = !is_top_or_bottom && surface_fill.params.separated_infills &&
+                                  (
+                                  is_centered_infill ||
+                                  params.config->solid_infill_rotate_template != "" ||
+                                  params.config->sparse_infill_rotate_template != "" );
+
         if( surface_fill.params.pattern == ipLockedZag ) {
 			params.locked_zag = true;
             params.infill_lock_depth = surface_fill.params.infill_lock_depth;
@@ -1318,7 +1362,65 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 			params.can_reverse = false;
 		for (ExPolygon& expoly : surface_fill.expolygons) {
 
-      f->no_overlap_expolygons = intersection_ex(surface_fill.no_overlap_expolygons, ExPolygons() = {expoly}, ApplySafetyOffset::Yes);
+            // Orca: separate infill / per-model pattern centering.
+            //
+            // First assign this fill region to the model part whose slice at this layer overlaps it
+            // the most. A strict "contains" test is ambiguous for assemblies whose parts overlap (a
+            // region may sit inside several parts, or straddle a boundary and be inside none), so we
+            // pick by intersection area instead.
+            //
+            // The center must belong to an *overlap group*, not a single part: parts that
+            // touch/overlap form one connected physical body that shares a single center, while a
+            // part detached from the rest of the assembly gets its own. This holds for both
+            // separated infills and Each_Model surface centering (Each_Model == per connected body).
+            // firstLayerObjGroups() already holds these connected components, so we widen the chosen
+            // part's bbox to the whole group it belongs to.
+            if (is_per_model_center || is_separate_infill) {
+                double               best_overlap  = 0.;
+                ObjectID             best_vol_id;
+                const PrintInstance* best_instance = nullptr;
+                for (const auto& instance : this->object()->instances()) {
+                    for (const auto& volume : instance.print_object->firstLayerObjSlice()) {
+                        if (f->layer_id >= volume.slices.size())
+                            continue;
+                        const double overlap = area(intersection_ex(volume.slices[f->layer_id], ExPolygons{expoly}));
+                        if (overlap > best_overlap) {
+                            best_overlap  = overlap;
+                            best_vol_id   = volume.volume_id;
+                            best_instance = &instance;
+                        }
+                    }
+                }
+                if (best_instance) {
+                    const Transform3d matrix  = best_instance->model_instance->get_matrix();
+                    Point             shift   = best_instance->shift; // get_volume_bbox takes a non-const ref
+                    auto&             volumes = best_instance->model_instance->get_object()->volumes;
+
+                    // Volume ids to center on: the whole overlap group the winning part belongs to,
+                    // falling back to just that part if it isn't part of any group.
+                    std::vector<ObjectID> center_ids;
+                    for (const auto& group : best_instance->print_object->firstLayerObjGroups()) {
+                        bool in_group = false;
+                        for (const ObjectID& vid : group.volume_ids)
+                            if (vid == best_vol_id) { in_group = true; break; }
+                        if (in_group) { center_ids = group.volume_ids; break; }
+                    }
+                    if (center_ids.empty())
+                        center_ids.push_back(best_vol_id);
+
+                    BoundingBox bbox;
+                    for (const ObjectID& vid : center_ids)
+                        for (auto model_volume : volumes)
+                            if (vid.id == model_volume->id().id) {
+                                bbox.merge(model_volume->get_volume_bbox(matrix, shift, true));
+                                break;
+                            }
+                    if (bbox.defined)
+                        f->set_bounding_box(bbox);
+                }
+            } // - End: separate infill / per-model pattern centering
+
+            f->no_overlap_expolygons = intersection_ex(surface_fill.no_overlap_expolygons, ExPolygons() = {expoly}, ApplySafetyOffset::Yes);
             if (params.symmetric_infill_y_axis) {
                 params.symmetric_y_axis = f->extended_object_bounding_box().center().x();
                 expoly.symmetric_y(params.symmetric_y_axis);
@@ -1570,18 +1672,18 @@ void Layer::make_ironing()
 				    ((config.top_shell_layers > 0 || (this->object()->print()->config().spiral_mode && config.bottom_shell_layers > 1)) &&
 					    (config.ironing_type == IroningType::TopSurfaces ||
 					        (config.ironing_type == IroningType::TopmostOnly && layerm->layer()->upper_layer == nullptr))))) {
-				if (config.wall_filament == config.solid_infill_filament || config.wall_loops == 0) {
+				if (config.outer_wall_filament_id == config.top_surface_filament_id || config.wall_loops == 0) {
 					// Iron the whole face.
-					ironing_params.extruder = config.solid_infill_filament;
+					ironing_params.extruder = config.top_surface_filament_id;
 				} else {
 					// Iron just the infill.
-					ironing_params.extruder = config.solid_infill_filament;
+					ironing_params.extruder = config.top_surface_filament_id;
 				}
 			}
 			if (ironing_params.extruder != -1) {
 				//TODO just_infill is currently not used.
 				ironing_params.just_infill 	= false;
-				// Get filament-specific overrides if configured, otherwise use default values
+				// ORCA: Get filament-specific overrides if configured, otherwise use process values
 				size_t extruder_idx = ironing_params.extruder - 1;
 				ironing_params.line_spacing = (!config.filament_ironing_spacing.is_nil(extruder_idx)
 					? config.filament_ironing_spacing.get_at(extruder_idx)
@@ -1592,11 +1694,20 @@ void Layer::make_ironing()
 				ironing_params.height = default_layer_height * 0.01 * (!config.filament_ironing_flow.is_nil(extruder_idx)
 					? config.filament_ironing_flow.get_at(extruder_idx)
 					: config.ironing_flow);
-				ironing_params.speed = (!config.filament_ironing_speed.is_nil(extruder_idx)
-					? config.filament_ironing_speed.get_at(extruder_idx)
-					: config.ironing_speed);
-                ironing_params.angle        = (config.ironing_angle_fixed ? 0 : calculate_infill_rotation_angle(this->object(), this->id(), config.solid_infill_direction.value, config.solid_infill_rotate_template.value)) + config.ironing_angle * M_PI / 180.;
-                ironing_params.fixed_angle = config.ironing_angle_fixed || !config.solid_infill_rotate_template.value.empty();
+                ironing_params.speed = (!config.filament_ironing_speed.is_nil(extruder_idx)
+                    ? config.filament_ironing_speed.get_at(extruder_idx)
+                    : config.ironing_speed);
+                const bool top_layer_direction_set = config.top_layer_direction.value >= 0.;
+                const double top_layer_base_angle  = top_layer_direction_set ?
+                    Geometry::deg2rad(config.top_layer_direction.value) :
+                    calculate_infill_rotation_angle(this->object(), this->id(), config.solid_infill_direction.value, config.solid_infill_rotate_template.value);
+                double ironing_angle = (config.ironing_angle_fixed ? 0. : top_layer_base_angle) + config.ironing_angle * M_PI / 180.;
+                if (config.align_infill_direction_to_model) {
+                    auto m = this->object()->trafo().matrix();
+                    ironing_angle += atan2((double)m(1, 0), (double)m(0, 0));
+                }
+                ironing_params.angle      = ironing_angle;
+                ironing_params.fixed_angle = config.ironing_angle_fixed || top_layer_direction_set || !config.solid_infill_rotate_template.value.empty();
 				ironing_params.pattern      = config.ironing_pattern;
 				ironing_params.layerm 		= layerm;
 				by_extruder.emplace_back(ironing_params);
